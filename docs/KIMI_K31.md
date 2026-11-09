@@ -30,6 +30,13 @@ Paths and sizes are environment variables (`WORK`, `HF_DIR`, `GGUF_DIR`, `QTYPE`
 
 The script targets this box: Arch Linux (`pacman`), 5 NVIDIA Turing GPUs (sm_75, about 48 GB each), 512 GB RAM and about 1.6 TB of disk (the HF download can be deleted after `convert`). Other systems need the dependency and `-DCMAKE_CUDA_ARCHITECTURES` lines in `build()` adapted.
 
+## GPUs: sm_75 and several cards
+
+The build passes `-DCMAKE_CUDA_ARCHITECTURES=75` (Turing: RTX 20, Quadro RTX, Titan RTX). `serve` uses llama.cpp's `--fit on`, which places
+layers and experts across every visible GPU and the rest in RAM, keeping `FIT_MARGIN_MIB` (default 3072) free on each card. Restrict the
+cards with `CUDA_VISIBLE_DEVICES`. For another generation change the architecture in `build()` (86 for RTX 30, 89 for RTX 40, 70 for V100).
+To place experts by hand use `--fit off -ngl 99 --n-cpu-moe N` and lower `N` until VRAM is full (see the comment in `serve()`).
+
 ## Pinned llama.cpp commit
 
 The patch applies at llama.cpp `669204ee2b9004845b34f26466a91d003edc98aa` (2026-11-06) and conflicts on later master in `conversion/__init__.py`, `conversion/base.py`, `conversion/kimi_k3.py`, `src/llama-model.cpp` and `src/llama-quant.cpp`. The script checks out that commit before `git am`. Override with `LLAMA_REF=<commit>` once the patch has been rebased.
