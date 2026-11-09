@@ -1,0 +1,515 @@
+From e4f8a927ab3b15918fb71fc0ba59800b5fb68d50 Mon Sep 17 00:00:00 2001
+From: mnavahan3 <mnavahan3@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:22 +0000
+Subject: [PATCH] model : add Kimi-K3.1 (DSA lightning indexer on kimi-k3)
+
+Kimi-K3.1-Pro is Kimi-K3 plus a DeepSeek-V3.2-style lightning indexer
+on every full-attention (MLA) layer; every other tensor keeps K3's name,
+dtype and shape. The indexer is nope-only:
+
+  q = wq_b_idx(q_a_norm(q_a(x)))   k = LayerNorm(wk_idx(x))
+  w = weights_proj(x) / sqrt(head_dim * n_head)
+  score[kv,t] = sum_h relu(q[h,t] . k[kv]) * w[h,t]  -> top-k cells per query
+
+convert:
+- route KimiK31ForConditionalGeneration to the kimi-k3 converter (its
+  text_config says KimiLinearForCausalLM, the old 48B architecture)
+- handle dsa_config whatever the architecture label, write the indexer
+  keys and tensors; fail on unsupported variants (indexer rope, index
+  sharing, rmsnorm k_norm, DSA layers != full-attention layers)
+- KIMI_K31_DENSE=1 drops the indexer: a plain kimi-k3 GGUF, dense
+  attention, exact up to index_topk tokens
+
+llama:
+- kimi-k3 reads the optional indexer keys; with them, the MLA layers get
+  the indexer tensors and llama_memory_hybrid_idx (indexer key cache cell
+  for cell with the MLA cache), and attend to the top-k cells only
+- fused lightning indexer and top-k mask when available, plain ops else;
+  the mask is cast to f16 for the fused indexer without flash attention
+- indexer LayerNorm uses rms_norm_eps, as in vLLM (f_norm_eps was unset)
+
+quantize (kimi-k3):
+- keep the indexer tensors (~180M params) unquantized
+- keep attn_k_b/attn_v_b unquantized: their 128-wide rows fall back to
+  q4_0 and the CPU repack buffer cannot run a 3D q4_0 k_b against the
+  permuted query (GGML_ASSERT in ggml_backend_sched_split_graph)
+
+Tested on tiny-random/kimi-k3.1-pro against a CPU PyTorch reference
+(Moonshot's K3 modeling + the indexer per vLLM's K3.1 code): last-token
+logits NMSE 1e-5 at top-2048 and 5e-5 at top-4 (vs 1.5e-1 for dense,
+so the selection is exercised), flash attention on/off, ubatch 512 and 7;
+indexer scores match to 4e-8 on identical inputs. test-llama-archs passes
+for kimi-k3 (indexer path), kimi-linear, glm5-next, deepseek32, qwen4exp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01NYcYC25egPKBnK8LVRNnWD
+---
+ conversion/__init__.py    |   1 +
+ conversion/base.py        |   2 +-
+ conversion/kimi_k3.py     |  67 +++++++++++++++
+ gguf-py/gguf/constants.py |   5 ++
+ src/llama-model.cpp       |   8 +-
+ src/llama-quant.cpp       |  11 +++
+ src/models/kimi-k3.cpp    | 174 ++++++++++++++++++++++++++++++++++++--
+ src/models/models.h       |   6 ++
+ 8 files changed, 266 insertions(+), 8 deletions(-)
+
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 0c6204b..574b6fe 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -156,6 +156,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "KORMoForCausalLM": "qwen",
+     "KimiK25ForConditionalGeneration": "deepseek",
+     "KimiK3ForConditionalGeneration": "kimi_k3",
++    "KimiK31ForConditionalGeneration": "kimi_k3",
+     "KimiLinearForCausalLM": "kimi_linear",
+     "KimiLinearModel": "kimi_linear",
+     "KimiVLForConditionalGeneration": "deepseek",
+diff --git a/conversion/base.py b/conversion/base.py
+index 841efe7..ecce23b 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -3404,7 +3404,7 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
+     # Kimi-K3's text_config reports "KimiLinearForCausalLM", which is the older
+     # Kimi-Linear-48B architecture and cannot load K3 (no attention residuals,
+     # latent MoE, situ, ...). Route on the top-level architecture instead.
+-    if model_type == ModelType.TEXT and arch in ("NEOChatModel", "StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration", "Nemotron3_5TranscribeForConditionalGeneration"):
++    if model_type == ModelType.TEXT and arch in ("NEOChatModel", "StepVLForConditionalGeneration", "Sarashina2VisionForCausalLM", "Exaone4_5_ForConditionalGeneration", "Step3p7ForConditionalGeneration", "KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration", "Nemotron3_5TranscribeForConditionalGeneration"):
+         return arch
+ 
+     # if "architectures" is found in the sub-config, use that instead
+diff --git a/conversion/kimi_k3.py b/conversion/kimi_k3.py
+index 70aabb7..c509c44 100644
+--- a/conversion/kimi_k3.py
++++ b/conversion/kimi_k3.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ import re
+ from pathlib import Path
+ from typing import Iterable, Iterator, TYPE_CHECKING
+@@ -59,6 +60,48 @@ class KimiK3Model(TextModel):
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         self._res_parts = {}
++        self._init_dsa()
++
++    #
++    # Kimi-K3.1 DSA indexer
++    #
++    # K3.1 is K3 with a lightning indexer on every full-attention (MLA) layer; every
++    # other tensor has the same name, dtype and shape. It is the DeepSeek-V3.2 indexer
++    # without RoPE:
++    #     q_idx = wq_b(q_a_norm(q_a(x)))    k_idx = LayerNorm(wk(x))    w = weights_proj(x)
++    #     score = sum_h relu(q_idx_h . k_idx) * w_h  ->  each query attends to its top-k keys
++    # so it is written as kimi-k3 plus the indexer keys and tensors. Keyed on dsa_config,
++    # not on the architecture name: re-uploads label K3.1 as KimiK3ForConditionalGeneration.
++    #
++    # KIMI_K31_DENSE=1 drops the indexer: the file is then a plain kimi-k3 GGUF that loads
++    # in llama.cpp builds without indexer support, with dense attention, which is exact
++    # while the context holds at most index_topk tokens.
++    #
++
++    def _init_dsa(self) -> None:
++        self._dsa = self.hparams.get("dsa_config")
++        self._dsa_dense = os.environ.get("KIMI_K31_DENSE", "0") not in ("", "0")
++        if self._dsa is None:
++            return
++
++        dsa = self._dsa
++        # what llama.cpp implements; fail loudly on a checkpoint that wants more
++        if dsa.get("index_rope_dim", 0) != 0:
++            raise NotImplementedError(f"indexer RoPE (index_rope_dim={dsa['index_rope_dim']})")
++        if dsa.get("index_topk_freq", 1) != 1:
++            raise NotImplementedError(f"indexer sharing across layers (index_topk_freq={dsa['index_topk_freq']})")
++        if dsa.get("index_k_norm_type", "rmsnorm") != "layernorm":
++            raise NotImplementedError(f"indexer k_norm type {dsa.get('index_k_norm_type')!r}")
++        if sorted(dsa["dsa_layers"]) != sorted(self.hparams["linear_attn_config"]["full_attn_layers"]):
++            raise NotImplementedError("DSA layers differ from the full-attention layers")
++        if self.hparams.get("q_lora_rank") is None:
++            raise NotImplementedError("the indexer query needs q_lora_rank")
++
++        if self._dsa_dense:
++            logger.warning("KIMI_K31_DENSE=1: dropping the DSA indexer, attention will be dense")
++        else:
++            logger.info(f"Kimi-K3.1 DSA indexer: {dsa['index_num_heads']} heads x {dsa['index_head_dim']}, "
++                        f"top-{dsa['index_topk']}, on {len(dsa['dsa_layers'])} layers")
+ 
+     def set_vocab(self):
+         # K3 has the same TikToken vocab as K2, so kimi-linear's vocab handling works.
+@@ -226,6 +269,12 @@ class KimiK3Model(TextModel):
+         # --- cross-layer attention residuals ---
+         self.gguf_writer.add_attn_res_block_size(self.hparams["attn_res_block_size"])
+ 
++        # --- K3.1 DSA indexer ---
++        if self._dsa is not None and not self._dsa_dense:
++            self.gguf_writer.add_indexer_head_count(self._dsa["index_num_heads"])
++            self.gguf_writer.add_indexer_key_length(self._dsa["index_head_dim"])
++            self.gguf_writer.add_indexer_top_k(self._dsa["index_topk"])
++
+     def prepare_tensors(self):
+         super().prepare_tensors()
+         if self._experts is not None:
+@@ -267,6 +316,16 @@ class KimiK3Model(TextModel):
+         return None
+ 
+     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        # --- K3.1 DSA indexer: names map as for DeepSeek-V3.2 ---
++        if ".self_attn.indexer." in name:
++            if self._dsa is None:
++                raise ValueError(f"indexer tensor {name!r} in a checkpoint without dsa_config")
++            if self._dsa_dense:
++                return
++            assert bid is not None and (bid + 1) in self._dsa["dsa_layers"], name
++            yield from super().modify_tensors(data_torch, name, bid)
++            return
++
+         # --- cross-layer attention residuals: fuse norm * proj ---
+         fused = self._try_fuse_res(data_torch, name, bid)
+         if fused is not None:
+@@ -343,3 +402,11 @@ class KimiK3Model(TextModel):
+             return
+ 
+         yield from super().modify_tensors(data_torch, name, bid)
++
++
++@ModelBase.register("KimiK31ForConditionalGeneration")
++@ModelBase.example("moonshotai/Kimi-K3.1-Pro")
++class KimiK31Model(KimiK3Model):
++    """Kimi-K3.1: Kimi-K3 plus the DSA indexer, which KimiK3Model handles from dsa_config."""
++
++    model_arch = gguf.MODEL_ARCH.KIMI_K3
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 930714f..f0ef0ea 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -6435,6 +6435,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.ATTN_V_B,
+         MODEL_TENSOR.ATTN_Q_A_NORM,
+         MODEL_TENSOR.ATTN_KV_A_NORM,
++        # DSA lightning indexer on the MLA layers (Kimi-K3.1)
++        MODEL_TENSOR.INDEXER_K_NORM,
++        MODEL_TENSOR.INDEXER_PROJ,
++        MODEL_TENSOR.INDEXER_ATTN_K,
++        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+         # KDA (linear-attention layers)
+         MODEL_TENSOR.SSM_CONV1D_Q,
+         MODEL_TENSOR.SSM_CONV1D_K,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3c4e598..40e5564 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3246,10 +3246,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     // only the sparse-attention architectures use llama_memory_hybrid_idx
+                     // a null filter_idx means the GGUF has no indexer tensors
+                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+-                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
++                    // Kimi-K3.1 is kimi-k3 plus a per-token DSA indexer on the MLA layers
++                    const bool kimi_k3_dsa   = (arch == LLM_ARCH_KIMI_K3 && hparams.indexer_top_k > 0);
++                    const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP) || kimi_k3_dsa;
+                     if (arch == LLM_ARCH_FALCON_H1) {
+                         filter_attn = [&](uint32_t) { return true; };
+                         filter_recr = [&](uint32_t) { return true; };
++                    } else if (kimi_k3_dsa) {
++                        filter_attn = [&](uint32_t il) { return !hparams.is_recr(il); };
++                        filter_recr = [&](uint32_t il) { return  hparams.is_recr(il); };
++                        filter_idx  = [&](uint32_t il) { return !hparams.is_recr(il); };
+                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+                         filter_attn = [&](uint32_t il) {
+                             return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index d62f7d5..711432c 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -371,6 +371,17 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+         quantize &= name.find("hc_")            == std::string::npos;
+     }
+ 
++    // kimi-k3.1: the DSA indexer picks the keys every MLA layer attends to and is tiny
++    // (~180M params in all), keep it out of low-bit quantization
++    if (arch == LLM_ARCH_KIMI_K3) {
++        quantize &= name.find("indexer.") == std::string::npos;
++        // the absorbed MLA k_b/v_b (~300M params in all) have 128-wide rows, so K-quants fall back
++        // to q4_0, and the CPU repack buffer cannot run a 3D q4_0 k_b against the permuted query
++        // (GGML_ASSERT in ggml_backend_sched_split_graph); keep them as glm5-next does
++        quantize &= name.find("attn_k_b.weight") == std::string::npos;
++        quantize &= name.find("attn_v_b.weight") == std::string::npos;
++    }
++
+     // glm5-next
+     if (arch == LLM_ARCH_GLM5_NEXT) {
+         quantize &= name.find("hc_")                     == std::string::npos;
+diff --git a/src/models/kimi-k3.cpp b/src/models/kimi-k3.cpp
+index 3644fe7..7aaa482 100644
+--- a/src/models/kimi-k3.cpp
++++ b/src/models/kimi-k3.cpp
+@@ -1,6 +1,7 @@
+ #include "models.h"
+ 
+ #include "llama-memory-recurrent.h"
++#include "llama-memory-hybrid-idx.h"
+ 
+ //
+ // Kimi-K3 text model: hybrid KDA (linear) + MLA (full) attention, as in kimi-linear.
+@@ -11,6 +12,10 @@
+ //   4. MLA output gate                 (sigmoid gate before o_proj)
+ //   5. full-rank KDA gate              (single ssm_g instead of ssm_g_a/ssm_g_b)
+ //
++// Kimi-K3.1 is the same model plus a DSA lightning indexer on every MLA layer
++// (the DeepSeek-V3.2 indexer without RoPE). It is present when the GGUF carries
++// the indexer keys; each query then attends to its indexer_top_k best cells only.
++//
+ 
+ void llama_model_kimi_k3::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+@@ -43,6 +48,21 @@ void llama_model_kimi_k3::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,         hparams.situ_beta);
+     ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA,  hparams.situ_linear_beta);
+ 
++    // Kimi-K3.1: DSA indexer, absent from K3 GGUFs
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    false);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k,     false);
++    if (hparams.indexer_top_k > 0) {
++        if (hparams.indexer_n_head == 0 || hparams.indexer_head_size == 0) {
++            throw std::runtime_error("kimi-k3: indexer top_k is set but its head count or key length is not");
++        }
++        if (hparams.n_lora_q == 0) {
++            throw std::runtime_error("kimi-k3: the DSA indexer needs q_lora_rank");
++        }
++        // the indexer k_norm is the model's only LayerNorm, and it uses rms_norm_eps
++        hparams.f_norm_eps = hparams.f_norm_rms_eps;
++    }
++
+     switch (hparams.n_layer()) {
+         case 93: type = LLM_TYPE_2_8T_A50B; break; // Kimi-K3
+         default: type = LLM_TYPE_UNKNOWN;
+@@ -132,6 +152,18 @@ void llama_model_kimi_k3::load_arch_tensors(llama_model_loader &) {
+             // K3: sigmoid output gate applied to the attention output before o_proj
+             layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head * n_embd_head_v}, TENSOR_NOT_REQUIRED);
+ 
++            // K3.1: DSA lightning indexer
++            if (hparams.indexer_top_k > 0) {
++                const int64_t n_idx_head = hparams.indexer_n_head;
++                const int64_t n_embd_idx = hparams.indexer_head_size;
++
++                layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {n_embd_idx}, 0);
++                layer.indexer_k_norm_b = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "bias",   i), {n_embd_idx}, 0);
++                layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, n_idx_head}, 0);
++                layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd, n_embd_idx}, 0);
++                layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, n_idx_head * n_embd_idx}, 0);
++            }
++
+             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, 0);
+         }
+ 
+@@ -249,6 +281,15 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
+     auto * inp_attn_kv = !hparams.is_mla() ? inp_kv->get_attn() : nullptr;
+     auto * inp_attn_k  =  hparams.is_mla() ? inp_k->get_attn()  : nullptr;
+ 
++    // K3.1: the indexer keys live in llama_memory_hybrid_idx, cell for cell with the MLA cache
++    const llama_kv_cache_context * mctx_idx = nullptr;
++    if (hparams.indexer_top_k > 0) {
++        GGML_ASSERT(inp_attn_k && "the kimi-k3 DSA indexer needs the absorbed (K-only) MLA cache");
++        mctx_idx = static_cast<const llama_memory_hybrid_idx_context *>(mctx)->get_idx();
++        GGML_ASSERT(mctx_idx && mctx_idx->get_n_kv() == inp_attn_k->mctx->get_n_kv() &&
++                    "the indexer cache must track the MLA cache cell for cell");
++    }
++
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     const int64_t n_head_kda = hparams.n_head();
+@@ -297,7 +338,7 @@ llama_model_kimi_k3::graph::graph(const llama_model & model, const llm_graph_par
+             cur = build_kda_layer(cur, layer, inp_rs, d_conv, head_dim, n_head_kda,
+                                   d_inner, n_seq_tokens, n_seqs, il);
+         } else {
+-            cur = build_mla_layer(cur, layer, inp_attn_k, inp_attn_kv,
++            cur = build_mla_layer(cur, layer, inp_attn_k, inp_attn_kv, mctx_idx,
+                                   n_embd_head_k_mla, n_embd_head_v_mla, kv_lora_rank,
+                                   n_embd_head_qk_rope, n_embd_head_qk_nope, kq_scale_mla, il);
+         }
+@@ -465,16 +506,19 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
+ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
+         ggml_tensor * cur, const llama_layer & layer,
+         llm_graph_input_attn_k * inp_attn_k, llm_graph_input_attn_kv * inp_attn_kv,
++        const llama_kv_cache_context * mctx_idx,
+         int64_t n_embd_head_k_mla, int64_t n_embd_head_v_mla, int64_t kv_lora_rank,
+         int64_t n_embd_head_qk_rope, int64_t n_embd_head_qk_nope, float kq_scale, int il) {
+ 
+     ggml_tensor * inp_gate = cur; // the output gate reads the *normed* layer input
+ 
+     ggml_tensor * Qcur;
++    ggml_tensor * qr = nullptr; // normed q latent, also the indexer query input
+     if (layer.wq_a) {
+-        Qcur = ggml_mul_mat(ctx0, layer.wq_a, cur);
+-        Qcur = build_norm(Qcur, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+-        Qcur = ggml_mul_mat(ctx0, layer.wq_b, Qcur);
++        qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
++        qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
++        cb(qr, "q_resid", il);
++        Qcur = ggml_mul_mat(ctx0, layer.wq_b, qr);
+     } else {
+         Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+     }
+@@ -510,8 +554,48 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
+         ggml_tensor * K = ggml_concat(ctx0, kv_cmpr_3d, k_pe, 0);
+         ggml_tensor * V = kv_cmpr_3d;
+ 
+-        // wo == NULL: the output projection is applied after the gate below
+-        out = build_attn(inp_attn_k, nullptr, NULL, nullptr, Q, K, V, nullptr, nullptr, layer.wv_b, kq_scale, il);
++        if (mctx_idx && layer.indexer_attn_k) {
++            // K3.1 DSA: same attention, restricted to the indexer's top-k cells
++            ggml_tensor * top_k = build_dsa_top_k(cur, qr, layer, inp_attn_k, mctx_idx, il);
++
++            ggml_build_forward_expand(gf, Q);
++            ggml_build_forward_expand(gf, K);
++            ggml_build_forward_expand(gf, inp_attn_k->mctx->cpy_k(ctx0, K, inp_attn_k->get_k_idxs(), il));
++
++            ggml_tensor * kq_mask = inp_attn_k->self_attn_mask.raw;
++            ggml_tensor * kq_mask_top_k = nullptr;
++            if (cparams.fused_top_k_mask) {
++                kq_mask_top_k = build_fused_top_k_mask(kq_mask, top_k, il);
++            } else {
++                // as llm_graph_context::build_attn for llama_kv_cache_dsa:
++                // a -inf mask with the top-k cells set to 0, plus the causal/sequence mask
++                ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
++                kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
++                                           kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
++
++                ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
++                                                      top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
++
++                ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
++                zeros = ggml_fill(ctx0, zeros, 0.0f);
++
++                kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
++                kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3],
++                                             kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
++                kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
++            }
++            cb(kq_mask_top_k, "kq_mask_dsa", il);
++
++            ggml_tensor * k_all = inp_attn_k->mctx->get_k(ctx0, il);
++            ggml_tensor * v_all = ggml_view_4d(ctx0, k_all, kv_lora_rank, k_all->ne[1], k_all->ne[2], k_all->ne[3],
++                                               k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
++
++            out = build_attn_mha(Q, k_all, v_all, nullptr, kq_mask_top_k, nullptr, nullptr, layer.wv_b, top_k->ne[0], kq_scale, il);
++            cb(out, "kqv_out", il);
++        } else {
++            // wo == NULL: the output projection is applied after the gate below
++            out = build_attn(inp_attn_k, nullptr, NULL, nullptr, Q, K, V, nullptr, nullptr, layer.wv_b, kq_scale, il);
++        }
+     } else {
+         ggml_tensor * Q = ggml_reshape_3d(ctx0, Qcur, n_embd_head_k_mla, n_head, n_tokens);
+         ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_b, kv_cmpr);
+@@ -542,6 +626,84 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
+     return out;
+ }
+ 
++//
++// Kimi-K3.1 DSA lightning indexer (DeepSeek-V3.2's, nope-only):
++//   q = wq_b_idx(qr)   k = LayerNorm(wk_idx(x))   w = weights_proj(x) / sqrt(head_dim * n_head)
++//   score[kv, t] = sum_h relu(q[h, t] . k[kv]) * w[h, t]   (+ the attention mask)
++// returns the indices of the top-k cells, [n_top, n_tokens]
++//
++
++ggml_tensor * llama_model_kimi_k3::graph::build_dsa_top_k(
++        ggml_tensor * cur, ggml_tensor * qr, const llama_layer & layer,
++        llm_graph_input_attn_k * inp_attn_k, const llama_kv_cache_context * mctx_idx, int il) {
++    GGML_ASSERT(qr != nullptr);
++
++    const int64_t n_idx_head = hparams.indexer_n_head;
++    const int64_t n_embd_idx = hparams.indexer_head_size;
++
++    // {n_embd_idx, n_idx_head, n_tokens}
++    ggml_tensor * idx_q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
++    idx_q = ggml_reshape_3d(ctx0, idx_q, n_embd_idx, n_idx_head, n_tokens);
++    cb(idx_q, "indexer_q", il);
++
++    // {n_embd_idx, 1, n_tokens}
++    ggml_tensor * idx_k = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
++    idx_k = build_norm(idx_k, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
++    idx_k = ggml_reshape_3d(ctx0, idx_k, n_embd_idx, 1, n_tokens);
++    cb(idx_k, "indexer_k", il);
++
++    // the indexer cache shares the MLA cache's cells, so its slots are the same k_idxs
++    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, idx_k, inp_attn_k->get_k_idxs(), il));
++
++    // {n_idx_head, n_tokens}, prescaled so the big score tensor needs no extra scale
++    ggml_tensor * idx_w = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
++    idx_w = ggml_scale(ctx0, idx_w, 1.0f / sqrtf(float(n_embd_idx * n_idx_head)));
++    cb(idx_w, "indexer_weights", il);
++
++    // cached keys {n_embd_idx, 1, n_kv, n_stream}
++    ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
++
++    const int64_t n_stream = k_all->ne[3];
++    idx_q = ggml_view_4d(ctx0, idx_q, idx_q->ne[0], idx_q->ne[1], idx_q->ne[2]/n_stream, n_stream,
++                         idx_q->nb[1], idx_q->nb[2], idx_q->nb[2]*(idx_q->ne[2]/n_stream), 0);
++    idx_w = ggml_view_4d(ctx0, idx_w, idx_w->ne[0], idx_w->ne[1]/n_stream, 1, n_stream,
++                         idx_w->nb[1], idx_w->nb[1]*(idx_w->ne[1]/n_stream), idx_w->nb[1]*(idx_w->ne[1]/n_stream), 0);
++
++    ggml_tensor * kq_mask = inp_attn_k->self_attn_mask.raw; // [n_kv, n_tokens/n_stream, 1, n_stream]
++
++    ggml_tensor * score = nullptr;
++    if (cparams.fused_lid) {
++        // the fused indexer takes an f16 mask; the attention mask is f32 without flash attention.
++        // casting it is cheap next to the [n_idx_head, n_tokens, n_kv] scores the plain ops build
++        ggml_tensor * mask_f16 = kq_mask->type == GGML_TYPE_F16 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
++        score = ggml_lightning_indexer(ctx0, idx_q, k_all, idx_w, mask_f16);
++        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
++    } else {
++        // {n_embd_idx, n_tokens, n_idx_head, n_stream} x {n_embd_idx, n_kv, 1, n_stream}
++        ggml_tensor * q_p = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
++        ggml_tensor * k_p = ggml_permute(ctx0, k_all, 0, 2, 1, 3);
++
++        // {n_kv, n_tokens, n_idx_head, n_stream}
++        ggml_tensor * kq = ggml_mul_mat(ctx0, k_p, q_p);
++        // -> {n_idx_head, n_tokens, n_kv, n_stream}, contiguous for relu
++        kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
++        kq = ggml_relu(ctx0, kq);
++        kq = ggml_mul(ctx0, kq, idx_w);
++        // {1, n_tokens, n_kv, n_stream} -> {n_kv, n_tokens, 1, n_stream}
++        kq = ggml_sum_rows(ctx0, kq);
++        score = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
++        // the mask is f16 under flash attention
++        score = ggml_add(ctx0, score, kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32));
++    }
++    cb(score, "indexer_score", il);
++
++    const uint32_t n_top = std::min<uint32_t>((uint32_t) score->ne[0], hparams.indexer_top_k);
++    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top));
++    cb(top_k, "top_k", il);
++
++    return top_k;
++}
++
+ //
+ // latent MoE: down-project, run the routed experts in the latent space, norm, up-project;
+ // shared experts stay at n_embd and read the un-projected input.
+diff --git a/src/models/models.h b/src/models/models.h
+index bc980dd..680b189 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -3070,10 +3070,16 @@ struct llama_model_kimi_k3 : public llama_model_base {
+         ggml_tensor * build_mla_layer(ggml_tensor * cur, const llama_layer & layer,
+                                       llm_graph_input_attn_k  * inp_attn_k,
+                                       llm_graph_input_attn_kv * inp_attn_kv,
++                                      const llama_kv_cache_context * mctx_idx,
+                                       int64_t n_embd_head_k_mla, int64_t n_embd_head_v_mla,
+                                       int64_t kv_lora_rank, int64_t n_embd_head_qk_rope,
+                                       int64_t n_embd_head_qk_nope, float kq_scale, int il);
+ 
++        // Kimi-K3.1 DSA lightning indexer: the top-k cells each query attends to
++        ggml_tensor * build_dsa_top_k(ggml_tensor * cur, ggml_tensor * qr, const llama_layer & layer,
++                                      llm_graph_input_attn_k * inp_attn_k,
++                                      const llama_kv_cache_context * mctx_idx, int il);
++
+         ggml_tensor * build_latent_moe(ggml_tensor * cur, const llama_layer & layer,
+                                        int64_t n_embd_latent, int il);
+     };
+-- 
+2.43.0
+
