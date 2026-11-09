@@ -452,6 +452,100 @@ if(STRATA_BUILD_TESTS)
   set_tests_properties(io_priority_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# ---- strata_host (GLM-5.3-Flash C11 host rules) -----------------------------
+# Plain C11, no backend and no toolkit: tensor names, the tuning-knob table, the FP4 expert pack and worker protocol,
+# the mixed-precision cache policy and the MTP draft rules.  Imported from lighttransport/Strata (MIT, third_party/
+# lighttransport-strata/NOTICE.md); the GLM engine that uses them is not part of this build yet (docs/GLM53.md).
+# Off the default path: a plain configure builds none of it.
+option(STRATA_GLM_HOST "Build the GLM-5.3-Flash host rules (strata_host) and, with STRATA_BUILD_TESTS, their tests" OFF)
+if(STRATA_GLM_HOST)
+  enable_language(C)
+  add_library(strata_host STATIC
+    src/host/glm_draft.c src/host/glm_env.c src/host/glm_expert_pack.c src/host/glm_fp4.c src/host/glm_fp4_cache.c
+    src/host/glm_fp4_layout.c src/host/glm_fp4_protocol.c src/host/glm_fp4_worker.c src/host/glm_layer.c
+    src/host/glm_mixed.c src/host/glm_names.c)
+  set_target_properties(strata_host PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+  target_include_directories(strata_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  if(UNIX)
+    target_link_libraries(strata_host PUBLIC m)
+  endif()
+  target_link_libraries(strata_host PUBLIC strata_warnings)
+endif()
+if(STRATA_GLM_HOST AND STRATA_BUILD_TESTS)
+  find_package(Threads REQUIRED)
+  # the rules and the spellings, on synthetic data: no model, no GPU
+  foreach(_host_test glm_names glm_env glm_expert_pack glm_expert_replay glm_layer glm_fp4_cache glm_draft glm_route_drop)
+    add_executable(${_host_test}_test tests/host/${_host_test}_test.c)
+    target_include_directories(${_host_test}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(${_host_test}_test PRIVATE strata_host)
+    add_test(NAME ${_host_test}_test COMMAND ${_host_test}_test)
+    set_tests_properties(${_host_test}_test PROPERTIES LABELS glm TIMEOUT 60)
+  endforeach()
+  add_executable(glm_fp4_worker_protocol_test tests/glm/fp4_worker_protocol_test.c)
+  target_link_libraries(glm_fp4_worker_protocol_test PRIVATE strata_host)
+  add_test(NAME glm_fp4_worker_protocol_test COMMAND glm_fp4_worker_protocol_test)
+  set_tests_properties(glm_fp4_worker_protocol_test PROPERTIES LABELS glm)
+  add_executable(glm_mixed_test src/host/glm_mixed_test.c)
+  target_link_libraries(glm_mixed_test PRIVATE strata_host)
+  add_test(NAME glm_mixed_test COMMAND glm_mixed_test)
+  set_tests_properties(glm_mixed_test PROPERTIES LABELS glm)
+
+  add_executable(glm_fp4_codec_test tests/host/glm_fp4_codec_test.cpp)
+  target_link_libraries(glm_fp4_codec_test PRIVATE strata_host)
+  add_test(NAME glm_fp4_codec_test COMMAND glm_fp4_codec_test)
+  set_tests_properties(glm_fp4_codec_test PROPERTIES LABELS glm)
+  # header-only C++20 pieces: the bounded accept rule, the expert cache, the host sampler, the prefix cache
+  foreach(_glm_cxx_test glm_bounded_accept glm_expert_cache glm_prefix_cache glm_sampler)
+    add_executable(${_glm_cxx_test}_test tests/host/${_glm_cxx_test}_test.cpp)
+    target_include_directories(${_glm_cxx_test}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(${_glm_cxx_test}_test PRIVATE cxx_std_20)
+    target_link_libraries(${_glm_cxx_test}_test PRIVATE Threads::Threads)
+    add_test(NAME ${_glm_cxx_test}_test COMMAND ${_glm_cxx_test}_test)
+    set_tests_properties(${_glm_cxx_test}_test PROPERTIES LABELS glm)
+  endforeach()
+  add_executable(glm_state_store_test tests/host/glm_state_store_test.cpp src/program/glm_state_store.cpp
+                 src/core/conversation_file.cpp)
+  target_include_directories(glm_state_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(glm_state_store_test PRIVATE cxx_std_20)
+  target_link_libraries(glm_state_store_test PRIVATE strata_host)
+  add_test(NAME glm_state_store_test COMMAND glm_state_store_test)
+  set_tests_properties(glm_state_store_test PROPERTIES LABELS glm)
+  add_executable(strata-glm-batch-route-sim tools/glm_batch_route_sim.cpp)
+  target_include_directories(strata-glm-batch-route-sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_features(strata-glm-batch-route-sim PRIVATE cxx_std_20)
+  add_test(NAME glm_batch_route_sim_test COMMAND strata-glm-batch-route-sim --self-test)
+  set_tests_properties(glm_batch_route_sim_test PROPERTIES LABELS glm)
+  # builds just the GLM host tests: cmake --build <dir> --target strata-glm-host-tests && ctest -L glm
+  add_custom_target(strata-glm-host-tests DEPENDS
+    glm_names_test glm_env_test glm_expert_pack_test glm_expert_replay_test glm_layer_test glm_fp4_cache_test glm_draft_test
+    glm_route_drop_test glm_fp4_worker_protocol_test glm_mixed_test glm_fp4_codec_test glm_bounded_accept_test
+    glm_expert_cache_test glm_prefix_cache_test glm_sampler_test glm_state_store_test strata-glm-batch-route-sim)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(glm_mixed_transport_test src/host/glm_mixed_transport_test.cpp)
+    target_link_libraries(glm_mixed_transport_test PRIVATE strata_host)
+    add_test(NAME glm_mixed_transport_test COMMAND glm_mixed_transport_test)
+    set_tests_properties(glm_mixed_transport_test PROPERTIES LABELS glm TIMEOUT 10)
+    add_executable(glm_exact_expert_cache_test tools/test_glm_exact_cache.cpp)
+    target_include_directories(glm_exact_expert_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(glm_exact_expert_cache_test PRIVATE cxx_std_20)
+    target_link_libraries(glm_exact_expert_cache_test PRIVATE Threads::Threads)
+    target_compile_options(glm_exact_expert_cache_test PRIVATE -UNDEBUG)
+    add_test(NAME glm_exact_expert_cache_test COMMAND glm_exact_expert_cache_test)
+    set_tests_properties(glm_exact_expert_cache_test PROPERTIES LABELS glm TIMEOUT 30)
+    # memfd-sealed executable pages; skips (77) where memfd or the seals are refused
+    add_executable(glm_ram_executable_test tests/host/glm_ram_executable_test.cpp)
+    target_link_libraries(glm_ram_executable_test PRIVATE strata_host)
+    target_compile_features(glm_ram_executable_test PRIVATE cxx_std_20)
+    add_test(NAME glm_ram_executable_test COMMAND glm_ram_executable_test)
+    add_test(NAME glm_ram_executable_off_test COMMAND glm_ram_executable_test --off)
+    set_tests_properties(glm_ram_executable_test glm_ram_executable_off_test
+      PROPERTIES LABELS glm TIMEOUT 10 SKIP_RETURN_CODE 77)
+    set_tests_properties(glm_ram_executable_test PROPERTIES ENVIRONMENT "STRATA_GLM_RAM_EXECUTABLE=1")
+    set_tests_properties(glm_ram_executable_off_test PROPERTIES ENVIRONMENT "STRATA_GLM_RAM_EXECUTABLE=0")
+    add_dependencies(strata-glm-host-tests glm_mixed_transport_test glm_exact_expert_cache_test glm_ram_executable_test)
+  endif()
+endif()
+
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
 # whole point of P1.S9 is that the decision is arithmetic you can check by hand.
