@@ -196,6 +196,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 66;
         return true;
+    case 19:   // IQ1_S: fp16 d, qs[32], qh[8] u16
+        elems = 256;
+        bytes = 50;
+        return true;
     case 17:
         elems = 256;
         bytes = 74;
@@ -227,6 +231,19 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
         elems = 1;
         bytes = 1;
+        return true;
+    case 25:   // I16
+        elems = 1;
+        bytes = 2;
+        return true;
+    case 26:   // I32 (DeepSeek-V4.1's Engram token map)
+        elems = 1;
+        bytes = 4;
+        return true;
+    case 27:   // I64 (its Engram hash multipliers, primes, offsets)
+    case 28:   // F64
+        elems = 1;
+        bytes = 8;
         return true;
     case 40:   // NVFP4: 64 values = 4 UE4M3 sub-block scales + 32 bytes of E2M1 codes
         elems = 64;
@@ -328,7 +345,8 @@ struct MetaValue {
     std::string s;                 // string payloads
     MetaType elem = MetaType::U32; // arrays
     uint64_t count = 0;
-    std::vector<MetaValue> items;
+    std::vector<MetaValue> items;  // arrays: the first 64 elements only (GgufFile::int_array reads all of them)
+    uint64_t offset = 0;           // arrays: file offset of the first element
     bool is_num() const { return type != MetaType::STRING && type != MetaType::ARRAY; }
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
@@ -381,6 +399,7 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
+        v.offset = c.pos();
         v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
@@ -428,6 +447,53 @@ public:
         return it == meta_.end() ? nullptr : &it->second;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
+    /// Every element of an integer array (the metadata keeps only a sample of long arrays). Signed types keep their
+    /// sign. Throws for a missing key or a non-integer array.
+    std::vector<int64_t> int_array(const std::string& key) const {
+        const MetaValue* v = get(key);
+        if (!v || v->type != MetaType::ARRAY) throw std::runtime_error("GGUF: missing array " + key);
+        size_t width = 0;
+        switch (v->elem) {
+        case MetaType::U8: case MetaType::I8: width = 1; break;
+        case MetaType::U16: case MetaType::I16: width = 2; break;
+        case MetaType::U32: case MetaType::I32: width = 4; break;
+        case MetaType::U64: case MetaType::I64: width = 8; break;
+        default: throw std::runtime_error("GGUF: " + key + " is not an integer array");
+        }
+        if (v->offset + v->count * width > size_) throw std::runtime_error("GGUF: truncated array " + key);
+        std::vector<int64_t> out((size_t)v->count);
+        const uint8_t* p = base_ + v->offset;
+        for (size_t i = 0; i < out.size(); ++i, p += width) {
+            switch (v->elem) {
+            case MetaType::U8: out[i] = *p; break;
+            case MetaType::I8: out[i] = (int8_t)*p; break;
+            case MetaType::U16: { uint16_t x; std::memcpy(&x, p, 2); out[i] = x; break; }
+            case MetaType::I16: { int16_t x; std::memcpy(&x, p, 2); out[i] = x; break; }
+            case MetaType::U32: { uint32_t x; std::memcpy(&x, p, 4); out[i] = x; break; }
+            case MetaType::I32: { int32_t x; std::memcpy(&x, p, 4); out[i] = x; break; }
+            default: { int64_t x; std::memcpy(&x, p, 8); out[i] = x; break; }   // U64 values above INT64_MAX wrap
+            }
+        }
+        return out;
+    }
+    // Release only fully covered tensor pages after an owned copy or before a
+    // bounded copy pass. File contents and adjacent metadata/tensors are intact.
+    void discard_tensor_pages(const TensorInfo& t,uint64_t bytes)const {
+#ifdef __linux__
+        const size_t page=static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        const uint64_t offset=data_start_+t.offset;
+        if(offset>size_ || bytes>size_-offset)throw std::out_of_range("GGUF discard tensor range");
+        const uint64_t first=(offset+page-1)/page*page,last=(offset+bytes)/page*page;
+        if(last>first) {
+            if(madvise(const_cast<uint8_t*>(base_)+first,last-first,MADV_DONTNEED))
+                throw std::runtime_error("GGUF source page release failed");
+            if(posix_fadvise(fd_,first,last-first,POSIX_FADV_DONTNEED))
+                throw std::runtime_error("GGUF source cache advice failed");
+        }
+#else
+        (void)t;(void)bytes;
+#endif
+    }
 
 private:
     void open() {
@@ -664,6 +730,42 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// MiniMax-M3 / M3.1's GGUF metadata contract. Tensor layout and sparse-layer
+/// selection are checked by the family loader; these keys make the basic
+/// geometry explicit before a decoder is selected.
+inline std::string check_architecture_minimax_m3(const GgufFile& g) {
+    static const char* const keys[] = {
+        "minimax-m3.block_count", "minimax-m3.embedding_length", "minimax-m3.context_length",
+        "minimax-m3.attention.head_count", "minimax-m3.attention.head_count_kv",
+        "minimax-m3.attention.key_length", "minimax-m3.attention.value_length",
+        "minimax-m3.expert_count", "minimax-m3.expert_used_count",
+        "minimax-m3.leading_dense_block_count", "minimax-m3.expert_feed_forward_length",
+        "minimax-m3.expert_shared_count", "minimax-m3.attention.indexer.head_count",
+        "minimax-m3.attention.indexer.key_length", "minimax-m3.attention.indexer.top_k",
+        "minimax-m3.attention.indexer.block_size", "minimax-m3.attention.indexer.local_blocks",
+    };
+    for (const char* k : keys) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num() || v->type == MetaType::F32 || v->type == MetaType::F64 || v->type == MetaType::BOOL)
+            return std::string(k) + " is not an integer";
+        if (!v->u) return std::string(k) + " must be positive";
+    }
+    const auto get = [&](const char* k) { return g.get(std::string("minimax-m3.") + k)->u; };
+    if (get("block_count") != 60 || get("embedding_length") != 6144 ||
+        get("attention.head_count") != 64 || get("attention.head_count_kv") != 4 ||
+        get("attention.key_length") != 128 || get("attention.value_length") != 128 ||
+        get("expert_count") != 128 || get("expert_used_count") != 4 ||
+        get("leading_dense_block_count") != 3 ||
+        get("attention.indexer.head_count") != 4 ||
+        get("attention.indexer.key_length") != 128 ||
+        get("attention.indexer.top_k") != 16 ||
+        get("attention.indexer.block_size") != 128 ||
+        get("attention.indexer.local_blocks") != 1)
+        return "geometry does not match MiniMax M3.1 Flash (60 layers, hidden 6144, 64/4 x 128, MSA 4 x 128 top-16 blocks, 128 experts top-4, 3 leading dense FFN layers)";
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -851,6 +953,7 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::MiniMaxM3) return check_architecture_minimax_m3(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
@@ -863,6 +966,36 @@ inline std::string check_engine_architecture(const GgufFile& g) {
     std::string err = check_architecture(g);
     if (!err.empty()) return err;
     return model_family_not_supported(model_family(g));
+}
+
+/// Validate the M3.1 MSA indexer tensors across the complete split model.
+/// The HF config's sparse_attention_freq marks all 60 layers sparse, and the
+/// released GGUFs carry the indexer on every layer, including the three
+/// leading dense-FFN layers.
+inline std::string check_minimax_m3_indexers(const GgufModel& model) {
+    if (model_family(model.meta()) != ModelFamily::MiniMaxM3)
+        return "model architecture is not minimax-m3";
+    std::string arch_error = check_architecture_minimax_m3(model.meta());
+    if (!arch_error.empty()) return arch_error;
+    const GgufFile& meta = model.meta();
+    const int64_t layers = (int64_t)meta.get("minimax-m3.block_count")->u;
+    const uint64_t hidden = meta.get("minimax-m3.embedding_length")->u;
+    const uint64_t heads = meta.get("minimax-m3.attention.indexer.head_count")->u;
+    const uint64_t dim = meta.get("minimax-m3.attention.indexer.key_length")->u;
+    const std::string names[] = {"indexer.q_proj.weight", "indexer.k_proj.weight",
+                                 "indexer.q_norm.weight", "indexer.k_norm.weight"};
+    const std::vector<std::vector<uint64_t>> shapes = {
+        {hidden, heads * dim}, {hidden, dim}, {dim}, {dim}
+    };
+    for (int64_t layer = 0; layer < layers; ++layer) {
+        for (size_t i = 0; i < 4; ++i) {
+            const std::string name = "blk." + std::to_string(layer) + "." + names[i];
+            const TensorInfo* tensor = model.find(name);
+            if (!tensor) return "missing " + name;
+            if (tensor->shape != shapes[i]) return name + " has an incompatible shape";
+        }
+    }
+    return {};
 }
 
 } // namespace strata

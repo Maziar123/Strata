@@ -452,24 +452,35 @@ if(STRATA_BUILD_TESTS)
   set_tests_properties(io_priority_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
-# ---- strata_host (GLM-5.3-Flash C11 host rules) -----------------------------
+# ---- strata_host (C11 host rules) -------------------------------------------
 # Plain C11, no backend and no toolkit: tensor names, the tuning-knob table, the FP4 expert pack and worker protocol,
 # the mixed-precision cache policy and the MTP draft rules.  Imported from lighttransport/Strata (MIT, third_party/
-# lighttransport-strata/NOTICE.md); the GLM engine that uses them is not part of this build yet (docs/GLM53.md).
-# Off the default path: a plain configure builds none of it.
-option(STRATA_GLM_HOST "Build the GLM-5.3-Flash host rules (strata_host) and, with STRATA_BUILD_TESTS, their tests" OFF)
+# lighttransport-strata/NOTICE.md).  Always built: the GGUF reader (artifact/gguf_reader.cpp) parses block names through it.
+# STRATA_GLM_HOST adds the GLM-5.3-Flash tests and tools on top (docs/GLM53.md); a plain configure builds none of those.
+option(STRATA_GLM_HOST "Build the GLM-5.3-Flash tests and tools (CPU FP4 experts, worker, model tools)" OFF)
+enable_language(C)
+add_library(strata_host STATIC
+  src/host/glm_draft.c src/host/glm_env.c src/host/glm_expert_pack.c src/host/glm_fp4.c src/host/glm_fp4_cache.c
+  src/host/glm_fp4_layout.c src/host/glm_fp4_protocol.c src/host/glm_fp4_worker.c src/host/glm_layer.c
+  src/host/glm_mixed.c src/host/glm_names.c)
+set_target_properties(strata_host PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+target_include_directories(strata_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if(UNIX)
+  target_link_libraries(strata_host PUBLIC m)
+endif()
+target_link_libraries(strata_host PUBLIC strata_warnings)
+target_link_libraries(strata_artifact INTERFACE strata_host)
 if(STRATA_GLM_HOST)
-  enable_language(C)
-  add_library(strata_host STATIC
-    src/host/glm_draft.c src/host/glm_env.c src/host/glm_expert_pack.c src/host/glm_fp4.c src/host/glm_fp4_cache.c
-    src/host/glm_fp4_layout.c src/host/glm_fp4_protocol.c src/host/glm_fp4_worker.c src/host/glm_layer.c
-    src/host/glm_mixed.c src/host/glm_names.c)
-  set_target_properties(strata_host PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
-  target_include_directories(strata_host PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  if(UNIX)
-    target_link_libraries(strata_host PUBLIC m)
-  endif()
-  target_link_libraries(strata_host PUBLIC strata_warnings)
+  # reads a GGUF or safetensors checkpoint and prints the per-layer plan (mixer, FFN, residual kind) the loader derives
+  add_executable(strata-model-inspect src/artifact/model_inspect.cpp)
+  target_link_libraries(strata-model-inspect PRIVATE strata_artifact strata_host)
+  # checkpoint tools for the GLM-5.3-Flash release formats (ModelOpt FP4/FP8, assembled Q2/Q3 GGUF)
+  add_executable(strata-glm-fp4-check tools/glm_fp4_check.cpp)
+  target_link_libraries(strata-glm-fp4-check PRIVATE strata_artifact strata_host)
+  add_executable(strata-glm-assemble tools/glm_assemble.cpp)
+  target_link_libraries(strata-glm-assemble PRIVATE strata_artifact strata_host)
+  add_executable(strata-glm-prune-experts tools/glm_prune_experts.cpp)
+  target_link_libraries(strata-glm-prune-experts PRIVATE strata_artifact strata_host)
 endif()
 if(STRATA_GLM_HOST AND STRATA_BUILD_TESTS)
   find_package(Threads REQUIRED)
@@ -494,6 +505,15 @@ if(STRATA_GLM_HOST AND STRATA_BUILD_TESTS)
   target_link_libraries(glm_fp4_codec_test PRIVATE strata_host)
   add_test(NAME glm_fp4_codec_test COMMAND glm_fp4_codec_test)
   set_tests_properties(glm_fp4_codec_test PROPERTIES LABELS glm)
+  # the FP4 CPU expert kernel: dispatched, forced to AVX2 and forced to the scalar path (STRATA_FORCE_ISA)
+  add_executable(glm_fp4_cpu_test tests/host/glm_fp4_cpu_test.cpp)
+  target_link_libraries(glm_fp4_cpu_test PRIVATE strata_kernels_cpu)
+  add_test(NAME glm_fp4_cpu_test COMMAND glm_fp4_cpu_test)
+  add_test(NAME glm_fp4_cpu_avx2_test COMMAND glm_fp4_cpu_test)
+  add_test(NAME glm_fp4_cpu_scalar_test COMMAND glm_fp4_cpu_test)
+  set_tests_properties(glm_fp4_cpu_avx2_test PROPERTIES ENVIRONMENT "STRATA_FORCE_ISA=avx2")
+  set_tests_properties(glm_fp4_cpu_scalar_test PROPERTIES ENVIRONMENT "STRATA_FORCE_ISA=sse")
+  set_tests_properties(glm_fp4_cpu_test glm_fp4_cpu_avx2_test glm_fp4_cpu_scalar_test PROPERTIES LABELS glm)
   # header-only C++20 pieces: the bounded accept rule, the expert cache, the host sampler, the prefix cache
   foreach(_glm_cxx_test glm_bounded_accept glm_expert_cache glm_prefix_cache glm_sampler)
     add_executable(${_glm_cxx_test}_test tests/host/${_glm_cxx_test}_test.cpp)
@@ -515,11 +535,17 @@ if(STRATA_GLM_HOST AND STRATA_BUILD_TESTS)
   target_compile_features(strata-glm-batch-route-sim PRIVATE cxx_std_20)
   add_test(NAME glm_batch_route_sim_test COMMAND strata-glm-batch-route-sim --self-test)
   set_tests_properties(glm_batch_route_sim_test PROPERTIES LABELS glm)
+  # the layer plan the loader derives from a GGUF header, on a synthetic file
+  add_executable(model_test src/artifact/model_test.cpp)
+  target_link_libraries(model_test PRIVATE strata_artifact strata_host)
+  add_test(NAME model_test COMMAND model_test)
+  set_tests_properties(model_test PROPERTIES LABELS glm)
   # builds just the GLM host tests: cmake --build <dir> --target strata-glm-host-tests && ctest -L glm
   add_custom_target(strata-glm-host-tests DEPENDS
     glm_names_test glm_env_test glm_expert_pack_test glm_expert_replay_test glm_layer_test glm_fp4_cache_test glm_draft_test
     glm_route_drop_test glm_fp4_worker_protocol_test glm_mixed_test glm_fp4_codec_test glm_bounded_accept_test
-    glm_expert_cache_test glm_prefix_cache_test glm_sampler_test glm_state_store_test strata-glm-batch-route-sim)
+    glm_expert_cache_test glm_prefix_cache_test glm_sampler_test glm_state_store_test glm_fp4_cpu_test model_test
+    strata-glm-batch-route-sim)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(glm_mixed_transport_test src/host/glm_mixed_transport_test.cpp)
     target_link_libraries(glm_mixed_transport_test PRIVATE strata_host)
@@ -2199,6 +2225,36 @@ endif()
 set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
+if(STRATA_GLM_HOST)
+  # GLM-5.3-Flash native FP4 experts on the CPU (docs/GLM53.md); reads its switches through strata_host
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/glm_fp4.cpp)
+  target_link_libraries(strata_kernels_cpu PUBLIC strata_host)
+  add_executable(strata-glm-fp4-cpu-bench tools/glm_fp4_cpu_bench.cpp)
+  target_link_libraries(strata-glm-fp4-cpu-bench PRIVATE strata_kernels_cpu)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # ucomm: plain C11 transport (UDP, and libibverbs loaded at run time, so no verbs headers are needed) between the GPU
+    # decoder and the CPU expert worker; the worker keeps the routed FP4 experts in RAM and answers one layer per message
+    add_library(strata_ucomm STATIC tools/ucomm/src/ucomm.c tools/ucomm/src/ucomm_boot.c tools/ucomm/src/ucomm_udp.c
+                tools/ucomm/src/ucomm_ib.c tools/ucomm/src/ibvew.c tools/ucomm/src/ucomm_file.c)
+    set_target_properties(strata_ucomm PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+    target_include_directories(strata_ucomm PUBLIC tools/ucomm/include)
+    target_link_libraries(strata_ucomm PUBLIC ${CMAKE_DL_LIBS})
+    add_executable(strata-glm-fp4-exact-bench tools/glm_fp4_exact_bench.cpp)
+    target_link_libraries(strata-glm-fp4-exact-bench PRIVATE strata_kernels_cpu strata_artifact strata_host strata_ucomm)
+    add_executable(strata-glm-fp4-cpu-worker src/program/glm_fp4_cpu_worker.cpp src/core/conversation_memory.cpp)
+    target_link_libraries(strata-glm-fp4-cpu-worker PRIVATE strata_kernels_cpu strata_artifact strata_ucomm strata_host)
+    if(STRATA_BUILD_TESTS)
+      add_executable(glm_fp4_idle_test tests/glm/fp4_idle_test.cpp)
+      target_link_libraries(glm_fp4_idle_test PRIVATE strata_artifact)
+      target_include_directories(glm_fp4_idle_test PRIVATE tools/ucomm/include)
+      add_test(NAME glm_fp4_idle_test COMMAND glm_fp4_idle_test)
+      set_tests_properties(glm_fp4_idle_test PROPERTIES LABELS glm)
+      add_dependencies(strata-glm-host-tests glm_fp4_idle_test glm_fp4_worker_client_test)
+      add_executable(glm_fp4_worker_client_test tests/glm/fp4_worker_client_test.cpp)
+      target_link_libraries(glm_fp4_worker_client_test PRIVATE strata_ucomm strata_artifact)
+    endif()
+  endif()
+endif()
 
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #

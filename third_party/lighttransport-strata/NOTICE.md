@@ -17,5 +17,20 @@ Imported unmodified (stage 1, the engine-independent host rules and their tests)
 - `tests/host/glm_*`, `tests/glm/fp4_worker_protocol_test.c`
 - `tools/glm_batch_route_sim.cpp`, `tools/test_glm_exact_cache.cpp`
 
-The CMake wiring (`STRATA_GLM_HOST`, `strata_host`, the `glm` test label) is written for this repository. The first commit
-of each imported file is the unmodified upstream copy.
+Imported unmodified (stage 2a, the CPU FP4 expert path and the checkpoint tools):
+
+- `src/kernels/cpu/glm_fp4.cpp`, `include/strata/kernels/cpu/{glm_fp4,expert_observer,llvq_expert,glm_fp4_exact}.hpp`,
+  `include/strata/kernels/cpu/exl3/{math,pool,mcg_avx2}.hpp`, `include/strata/net/glm_fp4_worker.hpp`
+- `src/program/glm_fp4_cpu_worker.cpp`, `tools/glm_fp4_cpu_bench.cpp`, `tools/glm_fp4_exact_bench.cpp`
+- `tests/host/glm_fp4_cpu_test.cpp`, `tests/glm/{fp4_idle_test,fp4_worker_client_test}.cpp`
+- `tools/ucomm/` (the TCP/RDMA transport the worker uses)
+- `include/strata/core/model.hpp`, `include/strata/artifact/{glm_exl3,glm_modelopt,json,safetensors,glm_fp4_partition,fp8_experts,glm_native}.hpp`
+- `src/artifact/{model_inspect,model_test}.cpp`, `tools/{glm_assemble,glm_fp4_check,glm_prune_experts}.cpp`
+
+Imported as lighttransport's version of a file this repository already had (the fork had not changed it since the shared merge
+base, so nothing is lost): `include/strata/artifact/{gguf_reader,model_family}.hpp`,
+`src/artifact/{gguf_reader.cpp,gguf_reader_test.cpp}`, `tests/core/{gguf_fixture.hpp,model_family_test.cpp}`. They add
+MiniMax-M3 family recognition, the IQ1_S/I16/I32/I64/F64 GGUF types and a call into `strata_host` for block names.
+
+The CMake wiring (`STRATA_GLM_HOST`, `strata_host`, the `glm` test label) is written for this repository. Every other file listed
+here is byte-identical to the upstream commit above.
