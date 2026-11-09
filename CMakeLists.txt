@@ -679,6 +679,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_GLM_HOST AND STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP)
+    # GLM-5.3-Flash GPU kernels (docs/GLM53.md): compiled, not yet called by any engine in this tree
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/glm.cu src/kernels/cuda/glm_prefill.cu
+                   src/kernels/cuda/glm_mailbox.cu src/kernels/cuda/glm_q23.cu src/kernels/cuda/glm_q8.cu
+                   src/kernels/cuda/glm_fp4.cu src/kernels/cuda/exl3.cu)
+    target_link_libraries(strata_kernels PUBLIC strata_host)
+  endif()
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
   option(STRATA_PARITY_GFX1100_QSA_SCORES "Build the exact gfx1100 QSA score/ID check" OFF)

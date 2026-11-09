@@ -27,6 +27,15 @@ Imported unmodified (stage 2a, the CPU FP4 expert path and the checkpoint tools)
 - `include/strata/core/model.hpp`, `include/strata/artifact/{glm_exl3,glm_modelopt,json,safetensors,glm_fp4_partition,fp8_experts,glm_native}.hpp`
 - `src/artifact/{model_inspect,model_test}.cpp`, `tools/{glm_assemble,glm_fp4_check,glm_prune_experts}.cpp`
 
+Imported unmodified (stage 2b, the GPU kernels; CUDA only, built but not yet called by any engine here):
+
+- `src/kernels/cuda/{glm,glm_prefill,glm_mailbox,glm_q23,glm_q8,glm_fp4,exl3}.cu`
+- `include/strata/kernels/{canon_expert,exl3,glm,glm_fp4,glm_mailbox,glm_prefill,glm_q23,glm_q8,glm_rows}.hpp`
+
+One shared header is edited by hand, not imported: `include/strata/kernels/iq_kernels.hpp` gains the two fields
+`NativeExpertLayout::swiglu_limit` and `gate_skip` (both default 0) that `glm_q23.cu` reads. The rest of upstream's edit to that
+header (DS41 declarations, `batch_tokens`) is not taken.
+
 Imported as lighttransport's version of a file this repository already had (the fork had not changed it since the shared merge
 base, so nothing is lost): `include/strata/artifact/{gguf_reader,model_family}.hpp`,
 `src/artifact/{gguf_reader.cpp,gguf_reader_test.cpp}`, `tests/core/{gguf_fixture.hpp,model_family_test.cpp}`. They add
